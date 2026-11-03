@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Private Chat</title>
+    <style>
+        body { background: #121212; color: #e0e0e0; font-family: Arial, sans-serif; margin: 0; padding: 15px; display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+        #chat-box { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; margin-bottom: 15px; padding-right: 5px; }
+        .msg { padding: 10px 14px; border-radius: 8px; max-width: 80%; word-wrap: break-word; font-size: 15px; }
+        .owner-msg { background: #005c4b; align-self: flex-end; }
+        .guest-msg { background: #2b2b2b; align-self: flex-start; }
+        .sys-msg { color: #888; font-size: 12px; align-self: center; text-align: center; }
+        #input-area { display: flex; gap: 10px; }
+        input[type="text"] { flex: 1; padding: 12px; border-radius: 6px; border: none; background: #2c2c2c; color: #fff; font-size: 15px; outline: none; }
+        button { padding: 12px 20px; background: #0a84ff; color: white; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        button:disabled { background: #555; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div id="chat-box"></div>
+    <div id="input-area">
+        <input type="text" id="msgInput" placeholder="Type an encrypted message..." autocomplete="off" disabled>
+        <button id="sendBtn" disabled>Send</button>
+    </div>
+
+    <script>
+        const WS_URL = "wss://autumn-moon-1de2.injamam-official-18.workers.dev/ws";
+        let ws, aesKey, myKeyPair, peerPublicKey;
+        
+        const chatBox = document.getElementById('chat-box');
+        const msgInput = document.getElementById('msgInput');
+        const sendBtn = document.getElementById('sendBtn');
+
+        // URL Hash থেকে Token বের করা (URL-এ ?token= দিলে তা সার্ভারে চলে যায়, তাই Hash # ব্যবহার করা হলো সুরক্ষার জন্য)
+        const hashToken = window.location.hash.substring(1);
+        const isOwner = hashToken.length > 0;
+        const authCode = isOwner ? hashToken : prompt("Enter Guest Code (e.g., RUPA):");
+
+        function sysLog(text) {
+            const div = document.createElement('div');
+            div.className = 'msg sys-msg'; div.innerText = text;
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        // WebCrypto API: E2EE Logic
+        async function generateEcdhKeys() {
+            return await crypto.subtle.generateKey({name: "ECDH", namedCurve: "P-256"}, false, ["deriveBits"]);
+        }
+
+        async function exportPublicKey(key) {
+            const exported = await crypto.subtle.exportKey("raw", key);
+            return btoa(String.fromCharCode(...new Uint8Array(exported)));
+        }
+
+        async function importPublicKey(b64) {
+            const bytes = new Uint8Array(atob(b64).split('').map(c => c.charCodeAt(0)));
+            return await crypto.subtle.importKey("raw", bytes, {name: "ECDH", namedCurve: "P-256"}, false, []);
+        }
+
+        async function deriveAesGcmKey(privateKey, publicKey) {
+            const sharedSecret = await crypto.subtle.deriveBits({name: "ECDH", public: publicKey}, privateKey, 256);
+            const hkdfKey = await crypto.subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveKey"]);
+            return await crypto.subtle.deriveKey(
+                {name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode("private-chat-v1")},
+                hkdfKey, {name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]
+            );
+        }
+
+        async function encryptMessage(text) {
+            const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit random Nonce (খুবই গুরুত্বপূর্ণ)
+            const encoded = new TextEncoder().encode(text);
+            const ciphertext = await crypto.subtle.encrypt({name: "AES-GCM", iv}, aesKey, encoded);
+            return {
+                iv: btoa(String.fromCharCode(...iv)),
+                data: btoa(String.fromCharCode(...new Uint8Array(ciphertext)))
+            };
+        }
+
+        async function decryptMessage(ivB64, dataB64) {
+            const iv = new Uint8Array(atob(ivB64).split('').map(c => c.charCodeAt(0)));
+            const data = new Uint8Array(atob(dataB64).split('').map(c => c.charCodeAt(0)));
+            const decrypted = await crypto.subtle.decrypt({name: "AES-GCM", iv}, aesKey, data);
+            return new TextDecoder().decode(decrypted);
+        }
+
+        // WebSocket Connection
+        async function connectChat() {
+            if(!authCode) { sysLog("Authentication required."); return; }
+            sysLog("Generating E2EE Keys...");
+            myKeyPair = await generateEcdhKeys();
+            const myPubKeyB64 = await exportPublicKey(myKeyPair.publicKey);
+
+            ws = new WebSocket(WS_URL);
+            ws.onopen = () => {
+                sysLog("Connected to relay. Authenticating...");
+                // Worker.js-এ অথেনটিকেশনের জন্য
+                ws.send(JSON.stringify({ type: "auth", role: isOwner ? "owner" : "guest", token: authCode }));
+                ws.send(JSON.stringify({ type: "pubkey", key: myPubKeyB64 }));
+            };
+
+            ws.onmessage = async (e) => {
+                try {
+                    const msg = JSON.parse(e.data);
+                    
+                    if(msg.type === "guest_status") {
+                        sysLog(msg.online ? "Guest is Online." : "Guest went Offline.");
+                    } 
+                    else if(msg.type === "pubkey") {
+                        sysLog("Peer Public Key received. Deriving Shared Secret...");
+                        peerPublicKey = await importPublicKey(msg.key);
+                        aesKey = await deriveAesGcmKey(myKeyPair.privateKey, peerPublicKey);
+                        sysLog("E2EE Established securely! You can now chat.");
+                        msgInput.disabled = false; sendBtn.disabled = false;
+                    } 
+                    else if(msg.type === "msg") {
+                        const plaintext = await decryptMessage(msg.iv, msg.data);
+                        displayMessage(plaintext, false);
+                    }
+                    else if(msg.type === "error") {
+                        sysLog("Server Error: " + msg.message);
+                    }
+                } catch(err) {
+                    console.error("Message handling error:", err);
+                }
+            };
+
+            ws.onclose = (e) => {
+                sysLog("Connection closed. Code: " + e.code);
+                msgInput.disabled = true; sendBtn.disabled = true;
+            };
+        }
+
+        function displayMessage(text, isSelf) {
+            const div = document.createElement('div');
+            div.className = 'msg ' + (isSelf ? 'owner-msg' : 'guest-msg');
+            div.innerText = text;
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            // 30 Seconds Auto-Delete (যাতে ডাটাবেসে বা স্ক্রিনে কিছুই থেকে না যায়)
+            setTimeout(() => {
+                div.remove();
+            }, 30000);
+        }
+
+        sendBtn.onclick = async () => {
+            const text = msgInput.value.trim();
+            if(!aesKey || !text) return;
+            
+            const encrypted = await encryptMessage(text);
+            ws.send(JSON.stringify({ type: "msg", iv: encrypted.iv, data: encrypted.data }));
+            
+            displayMessage(text, true);
+            msgInput.value = "";
+        };
+
+        msgInput.addEventListener("keypress", (e) => { if(e.key === "Enter") sendBtn.click(); });
+
+        connectChat();
+    </script>
+</body>
+</html>
