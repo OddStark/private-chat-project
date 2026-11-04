@@ -4,8 +4,27 @@
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>Private Chat</title>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101418;color:#e9eef2;font:16px system-ui,sans-serif;height:100dvh;display:flex;flex-direction:column;max-width:760px;margin-inline:auto;padding:12px}header{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 2px 14px;border-bottom:1px solid #2a333b}#status{font-size:12px;color:#aebbc5}#chat-box{flex:1;overflow:auto;display:flex;flex-direction:column;gap:9px;padding:14px 0}.msg{max-width:84%;padding:10px 13px;border-radius:14px;overflow-wrap:anywhere;white-space:pre-wrap}.mine{align-self:flex-end;background:#075e54}.theirs{align-self:flex-start;background:#26313a}.sys{align-self:center;color:#9aa8b3;font-size:12px;text-align:center}.controls{display:flex;gap:8px;padding:8px 0}.controls input{min-width:0;flex:1;background:#202a32;color:white;border:1px solid #394650;border-radius:10px;padding:12px;font-size:16px}.controls button,header button{border:0;border-radius:10px;background:#2478d4;color:white;font-weight:600;padding:10px 14px}button:disabled,input:disabled{opacity:.45}#typing{min-height:18px;color:#aebbc5;font-size:12px}#tools{display:flex;gap:8px}#tools button{background:#36434d}
+
+/* Privacy deterrence: visible watermark, not screenshot blocking. */
+#privacy-watermark{position:fixed;inset:0;z-index:900;pointer-events:none;overflow:hidden;display:flex;flex-direction:column;justify-content:space-around;opacity:.13}
+#privacy-watermark .wm-row{white-space:nowrap;transform:rotate(-19deg);font-size:12px;font-weight:700;letter-spacing:2px;color:#fff;text-align:center;text-shadow:0 1px 2px #000}
+#privacy-cover{position:fixed;inset:0;z-index:1200;background:#101418;color:#e9eef2;display:flex;align-items:center;justify-content:center;padding:28px;text-align:center}
+#privacy-cover[hidden]{display:none}
+#privacy-cover .cover-card{max-width:360px;border:1px solid #394650;border-radius:16px;padding:24px;background:#182128}
+#privacy-cover button{margin-top:16px;border:0;border-radius:10px;background:#2478d4;color:#fff;font-weight:600;padding:12px 20px;font-size:16px}
+
 </style></head>
 <body>
+
+<div id="privacy-watermark" aria-hidden="true"></div>
+<div id="privacy-cover" hidden role="dialog" aria-modal="true" aria-labelledby="privacy-cover-title">
+  <div class="cover-card">
+    <strong id="privacy-cover-title">Chat temporarily hidden</strong>
+    <p>For privacy, the chat was covered while this page was in the background.</p>
+    <button id="resumeChatBtn" type="button">Resume chat</button>
+  </div>
+</div>
+
 <header><div><strong>Private Chat</strong><div id="status">Connecting…</div></div><div id="tools"><button id="clearBtn" type="button">Clear chat</button></div></header>
 <div id="chat-box" aria-live="polite"></div><div id="typing"></div>
 <form class="controls" id="form"><input id="msgInput" maxlength="4000" placeholder="Type a message…" autocomplete="off" disabled><button id="sendBtn" disabled>Send</button></form>
@@ -41,5 +60,32 @@ ws.onerror=()=>{statusEl.textContent='Connection error';};ws.onclose=e=>{ready=f
 form.addEventListener('submit',async e=>{e.preventDefault();const text=input.value.trim();if(!text||!aesKey||ws?.readyState!==1)return;const id=crypto.randomUUID();try{const ciphertext=await encrypt(text);ws.send(JSON.stringify({type:'message',id,ciphertext}));display(text,id,true);input.value='';if(typingActive){typingActive=false;ws.send(JSON.stringify({type:'typing',active:false}));}}catch(e){log('Message encryption failed.');}});
 input.addEventListener('input',()=>{if(!ready||ws?.readyState!==1)return;const active=!!input.value;if(active!==typingActive){typingActive=active;ws.send(JSON.stringify({type:'typing',active}));}clearTimeout(typingTimer);if(active)typingTimer=setTimeout(()=>{typingActive=false;if(ws?.readyState===1)ws.send(JSON.stringify({type:'typing',active:false}));},1800);});
 document.getElementById('clearBtn').addEventListener('click',()=>{for(const id of [...messages.keys()])deleteMessage(id);if(ws?.readyState===1)ws.send(JSON.stringify({type:'clear'}));log('Chat cleared for this session.');});
+
+// Privacy layer: watermark + cover when the browser page is backgrounded.
+// This does NOT block screenshots or screen recording initiated by the OS.
+const privacyCover = document.getElementById('privacy-cover');
+const watermark = document.getElementById('privacy-watermark');
+const resumeChatBtn = document.getElementById('resumeChatBtn');
+const privacySessionId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2)).slice(0, 8).toUpperCase();
+const privacyStamp = new Date().toLocaleString();
+const watermarkText = `PRIVATE CHAT • DO NOT SHARE • SESSION ${privacySessionId} • ${privacyStamp}`;
+for (let i = 0; i < 7; i++) {
+  const row = document.createElement('div');
+  row.className = 'wm-row';
+  row.textContent = `${watermarkText}     ${watermarkText}`;
+  watermark.appendChild(row);
+}
+function coverChatForBackground() {
+  privacyCover.hidden = false;
+  input.blur();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') coverChatForBackground();
+});
+window.addEventListener('pagehide', coverChatForBackground);
+resumeChatBtn.addEventListener('click', () => {
+  if (document.visibilityState === 'visible') privacyCover.hidden = true;
+});
+
 connect();
 </script></body></html>
